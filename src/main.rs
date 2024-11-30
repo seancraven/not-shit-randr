@@ -27,7 +27,7 @@ fn launch_xrandr(arg: &str) -> String {
 
 fn main() {
     let possible_monitors = launch_xrandr("-q");
-    let Ok(possible_monitors) = Monitors::from_cli_text(&possible_monitors)
+    let Ok(possible_monitors) = Monitors::from_query(possible_monitors.trim())
         .map_err(|e| eprintln!("Parseing the output of xrandr failed due to {}", e))
     else {
         exit(1);
@@ -36,16 +36,19 @@ fn main() {
         eprintln!("No active monitors found.");
         exit(1);
     }
+    if possible_monitors.monitors.len() == 1 {
+        exit(0);
+    }
     let active_string = launch_xrandr("--listactivemonitors");
 
     let Ok(current_monitors) =
-        Monitors::get_current_from_list(&active_string).map_err(|e| eprintln!("{}", e))
+        Monitors::from_listactivemonitors(active_string.trim()).map_err(|e| eprintln!("{}", e))
     else {
         exit(1)
     };
-    if current_monitors.get_biggest().name != possible_monitors.get_biggest().name {
+    if current_monitors.largest().name != possible_monitors.largest().name {
         Command::new("xrandr")
-            .args(possible_monitors.get_biggest_command_string())
+            .args(possible_monitors.largest_on_command_string())
             .spawn()
             .unwrap()
             .wait()
@@ -59,20 +62,20 @@ struct Monitors {
 }
 
 impl Monitors {
-    fn from_cli_text(xrandr_outputs: &str) -> Result<Monitors> {
-        let chunks = Monitors::parse_xrandr_monitors(xrandr_outputs);
+    fn from_query(xrandr_outputs: &str) -> Result<Monitors> {
+        let chunks = Monitors::chunks_from_activemonitors(xrandr_outputs);
         let alive_monitors = chunks
             .into_iter()
             .skip(1)
             .filter(|vec| !vec[0].contains("disconnected"))
-            .map(Monitor::parse_max_from_chunk)
+            .map(Monitor::parse_monitor_from_listactivemonitors_chunk)
             .collect::<Result<Vec<Monitor>>>()
             .context("Failure during parsing out monitor details")?;
         Ok(Monitors {
             monitors: alive_monitors,
         })
     }
-    fn parse_xrandr_monitors(xrandr_outputs: &str) -> Vec<Vec<String>> {
+    fn chunks_from_activemonitors(xrandr_outputs: &str) -> Vec<Vec<String>> {
         let mut chunks = Vec::new();
         let mut lines: Vec<String> = xrandr_outputs.trim().lines().map(String::from).collect();
         let mut peak;
@@ -93,7 +96,7 @@ impl Monitors {
         }
         chunks
     }
-    fn get_biggest(&self) -> &Monitor {
+    fn largest(&self) -> &Monitor {
         let mut biggest_monitor = &self.monitors[0];
         for monitor in &self.monitors {
             if monitor.width > biggest_monitor.width {
@@ -102,14 +105,14 @@ impl Monitors {
         }
         biggest_monitor
     }
-    fn get_biggest_command_string(&self) -> Vec<String> {
-        let name = self.get_biggest().name.clone();
+    fn largest_on_command_string(&self) -> Vec<String> {
+        let name = self.largest().name.clone();
         self.monitors
             .iter()
-            .flat_map(|m| m.set_strings(m.name == name))
+            .flat_map(|m| m.command_string(m.name == name))
             .collect::<Vec<String>>()
     }
-    fn get_current_from_list(listactivemonitors: &str) -> Result<Monitors> {
+    fn from_listactivemonitors(listactivemonitors: &str) -> Result<Monitors> {
         let mut monitors = Vec::new();
         for line in listactivemonitors.lines().skip(1) {
             let mut line_iter = line.split(' ');
@@ -117,20 +120,28 @@ impl Monitors {
                 "Expected to parse name. Found no whitespace {}",
                 line
             ))?;
+            line_iter.next_back();
             let width_height = line_iter
                 .next_back()
                 .context(format!("Expect mode after name {}.", line))?;
             let (width, height) = width_height.split_once('x').context(format!(
                 "Expect to get both width and height from split {}.",
-                width_height
+                line
             ))?;
-            let width = width.trim_end_matches("/*").parse()?;
-            let height = height.trim_end_matches("/*").parse()?;
+            let width = width
+                .split("/")
+                .next()
+                .context(format!("Stripping / out of output failed {}", width))?
+                .parse()?;
+            let height = height
+                .split("/")
+                .next()
+                .context(format!("Stripping / out of output failed {}", width))?
+                .parse()?;
             monitors.push(Monitor {
                 name: name.into(),
                 height,
                 width,
-                refresh: String::new(),
             })
         }
         Ok(Monitors { monitors })
@@ -142,10 +153,9 @@ struct Monitor {
     height: usize,
     width: usize,
     name: String,
-    refresh: String,
 }
 impl Monitor {
-    fn set_strings(&self, on: bool) -> Vec<String> {
+    fn command_string(&self, on: bool) -> Vec<String> {
         if on {
             return vec![
                 "--output".into(),
@@ -156,7 +166,7 @@ impl Monitor {
         };
         vec!["--output".into(), self.name.clone(), "--off".into()]
     }
-    fn parse_max_from_chunk(chunk: impl AsRef<[String]>) -> Result<Monitor> {
+    fn parse_monitor_from_listactivemonitors_chunk(chunk: impl AsRef<[String]>) -> Result<Monitor> {
         let chunk = chunk.as_ref();
         let (name, _) = chunk[0]
             .split_once(' ')
@@ -166,7 +176,7 @@ impl Monitor {
             "Can't find max_refreshrate and resolution from: {}",
             max_res
         ))?;
-        let (primary_refreshrate, _) = refreshrate
+        let (_, _) = refreshrate
             .trim()
             .split_once(' ')
             .context(format!(
@@ -187,10 +197,8 @@ impl Monitor {
             name: String::from(name),
             width,
             height,
-            refresh: String::from(primary_refreshrate),
         })
     }
-    // Used to asses state of displays.
 }
 
 #[cfg(test)]
@@ -270,7 +278,7 @@ HDMI-1-0 connected 2560x1440+0+0 (normal left inverted right x axis y axis) 597m
 
     #[test]
     fn test_parse() {
-        let chunks = parse_xrandr_monitors(OUTPUT);
+        let chunks = Monitors::chunks_from_activemonitors(OUTPUT);
         let chunk_str = chunks
             .into_iter()
             .flatten()
@@ -281,16 +289,10 @@ HDMI-1-0 connected 2560x1440+0+0 (normal left inverted right x axis y axis) 597m
 
     #[test]
     fn test_monitor_parse() {
-        let monitors = parse_xrandr_monitors(OUTPUT.trim_end())
-            .into_iter()
-            .filter(|chunks| !chunks[0].contains("disconnected") && chunks[0].contains("connected"))
-            .map(Monitor::parse_max_from_chunk)
-            .collect::<Result<Vec<Monitor>>>()
-            .map_err(|e| {
-                eprintln!("{}", e);
-                e
-            });
-
-        assert_eq!(monitors.unwrap().len(), 2)
+        let monitors = Monitors::from_query(OUTPUT.trim_end()).unwrap();
+        assert_eq!(monitors.monitors.len(), 2);
+        assert_eq!(monitors.largest().name, "HDMI-1-0");
+        assert_eq!(monitors.largest().width, 2560);
+        assert_eq!(monitors.largest().height, 1440);
     }
 }
