@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use core::str;
 use std::process::{exit, Command};
 
-fn main() {
-    let Ok(output_string) = Command::new("xrandr")
-        .arg("-q")
+fn launch_xrandr(arg: &str) -> String {
+    let Ok(output) = Command::new("xrandr")
+        .arg(arg)
         .output()
         .context("During launching xrandr an error occured")
         .map_err(|e| {
@@ -13,37 +13,44 @@ fn main() {
     else {
         exit(1);
     };
-    let Ok(utf8_out) = &str::from_utf8(&output_string.stdout) else {
-        eprintln!("Non utf8 characters encountered when parsing xrandr output.");
-        exit(1);
-    };
-    let Ok(monitors) = Monitors::from_cli_text(utf8_out)
+    match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "Non utf8 characters encountered when parsing xrandr output. {}",
+                e
+            );
+            exit(1);
+        }
+    }
+}
+
+fn main() {
+    let possible_monitors = launch_xrandr("-q");
+    let Ok(possible_monitors) = Monitors::from_cli_text(&possible_monitors)
         .map_err(|e| eprintln!("Parseing the output of xrandr failed due to {}", e))
     else {
         exit(1);
     };
-    if monitors.monitors.is_empty() {
+    if possible_monitors.monitors.is_empty() {
         eprintln!("No active monitors found.");
         exit(1);
     }
-    let mut biggest_monitor = &monitors.monitors[0];
-    for monitor in &monitors.monitors {
-        if monitor.width > biggest_monitor.width {
-            biggest_monitor = monitor;
-        }
+    let active_string = launch_xrandr("--listactivemonitors");
+
+    let Ok(current_monitors) =
+        Monitors::get_current_from_list(&active_string).map_err(|e| eprintln!("{}", e))
+    else {
+        exit(1)
+    };
+    if current_monitors.get_biggest().name != possible_monitors.get_biggest().name {
+        Command::new("xrandr")
+            .args(possible_monitors.get_biggest_command_string())
+            .spawn()
+            .unwrap()
+            .wait()
+            .unwrap();
     }
-    let name = biggest_monitor.name.clone();
-    let commands = monitors
-        .monitors
-        .into_iter()
-        .flat_map(|m| m.set_strings(m.name == name))
-        .collect::<Vec<String>>();
-    Command::new("xrandr")
-        .args(commands)
-        .spawn()
-        .unwrap()
-        .wait()
-        .unwrap();
 }
 
 #[derive(Debug)]
@@ -53,7 +60,7 @@ struct Monitors {
 
 impl Monitors {
     fn from_cli_text(xrandr_outputs: &str) -> Result<Monitors> {
-        let chunks = parse_xrandr_monitors(xrandr_outputs);
+        let chunks = Monitors::parse_xrandr_monitors(xrandr_outputs);
         let alive_monitors = chunks
             .into_iter()
             .skip(1)
@@ -64,6 +71,69 @@ impl Monitors {
         Ok(Monitors {
             monitors: alive_monitors,
         })
+    }
+    fn parse_xrandr_monitors(xrandr_outputs: &str) -> Vec<Vec<String>> {
+        let mut chunks = Vec::new();
+        let mut lines: Vec<String> = xrandr_outputs.trim().lines().map(String::from).collect();
+        let mut peak;
+        while lines.len() > 1 {
+            peak = 1;
+            let mut peak_line = &lines[peak];
+            while !peak_line.contains("connected") {
+                match lines.get(peak) {
+                    Some(p) => {
+                        peak_line = p;
+                    }
+                    None => break,
+                };
+                peak += 1
+            }
+            // Double allocation of the print could probably just steal this out of the buffer.
+            chunks.push(lines.drain(..peak).collect());
+        }
+        chunks
+    }
+    fn get_biggest(&self) -> &Monitor {
+        let mut biggest_monitor = &self.monitors[0];
+        for monitor in &self.monitors {
+            if monitor.width > biggest_monitor.width {
+                biggest_monitor = monitor;
+            }
+        }
+        biggest_monitor
+    }
+    fn get_biggest_command_string(&self) -> Vec<String> {
+        let name = self.get_biggest().name.clone();
+        self.monitors
+            .iter()
+            .flat_map(|m| m.set_strings(m.name == name))
+            .collect::<Vec<String>>()
+    }
+    fn get_current_from_list(listactivemonitors: &str) -> Result<Monitors> {
+        let mut monitors = Vec::new();
+        for line in listactivemonitors.lines().skip(1) {
+            let mut line_iter = line.split(' ');
+            let name = line_iter.next_back().context(format!(
+                "Expected to parse name. Found no whitespace {}",
+                line
+            ))?;
+            let width_height = line_iter
+                .next_back()
+                .context(format!("Expect mode after name {}.", line))?;
+            let (width, height) = width_height.split_once('x').context(format!(
+                "Expect to get both width and height from split {}.",
+                width_height
+            ))?;
+            let width = width.trim_end_matches("/*").parse()?;
+            let height = height.trim_end_matches("/*").parse()?;
+            monitors.push(Monitor {
+                name: name.into(),
+                height,
+                width,
+                refresh: String::new(),
+            })
+        }
+        Ok(Monitors { monitors })
     }
 }
 
@@ -121,34 +191,6 @@ impl Monitor {
         })
     }
     // Used to asses state of displays.
-    fn get_current_from_list(listactivemonitors: &str) -> Result<Vec<Monitor>> {
-        for line in listactivemonitors.lines().skip(1) {
-            todo!();
-        }
-        Ok(vec![])
-    }
-}
-
-fn parse_xrandr_monitors(xrandr_outputs: &str) -> Vec<Vec<String>> {
-    let mut chunks = Vec::new();
-    let mut lines: Vec<String> = xrandr_outputs.trim().lines().map(String::from).collect();
-    let mut peak;
-    while lines.len() > 1 {
-        peak = 1;
-        let mut peak_line = &lines[peak];
-        while !peak_line.contains("connected") {
-            match lines.get(peak) {
-                Some(p) => {
-                    peak_line = p;
-                }
-                None => break,
-            };
-            peak += 1
-        }
-        // Double allocation of the print could probably just steal this out of the buffer.
-        chunks.push(lines.drain(..peak).collect());
-    }
-    chunks
 }
 
 #[cfg(test)]
