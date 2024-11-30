@@ -46,7 +46,9 @@ fn main() {
     else {
         exit(1)
     };
-    if current_monitors.largest().name != possible_monitors.largest().name {
+    if current_monitors.largest().name != possible_monitors.largest().name
+        || current_monitors.monitors.len() > 1
+    {
         Command::new("xrandr")
             .args(possible_monitors.largest_on_command_string())
             .spawn()
